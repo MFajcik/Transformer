@@ -1,13 +1,17 @@
 import copy
 import math
+import os
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn
+import spacy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wget
+from torchtext import data, datasets
 
 seaborn.set_context(context="talk")
 VERBOSE = False
@@ -121,7 +125,7 @@ class EncoderLayer(nn.Module):
         self.sublayer = clones(SublayerConnection(size, dropout), 2)
         self.size = size
 
-    def forward(self, x, mask):
+    def forward(self, x, mask=None):
         "Follow Figure 1 (left) for connections."
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
         return self.sublayer[1](x, self.feed_forward)
@@ -246,7 +250,7 @@ class MultiHeadedAttention(nn.Module):
         assert d_model % heads == 0
         # We assume d_v always equals d_k
         self.d_k = d_model // heads  # dimensionality over one head
-        self.heads = heads
+        self.h = heads
         # 4 - for query, key, value transformation + output transformation
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
@@ -272,13 +276,13 @@ class MultiHeadedAttention(nn.Module):
         # this code transforms query, key and value with d_model x d_model matrices
         # and splits each into bsz x h (number of splits) x length x d_k
         query_, key_, value_ = \
-            [l(x).view(nbatches, -1, self.heads, self.d_k).transpose(1, 2)
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
 
         # Rewritten into more clear representation
-        query = self.linears[0](query).view(nbatches, -1, self.heads, self.d_k).transpose(1, 2)
-        key = self.linears[1](key).view(nbatches, -1, self.heads, self.d_k).transpose(1, 2)
-        value = self.linears[2](value).view(nbatches, -1, self.heads, self.d_k).transpose(1, 2)
+        query = self.linears[0](query).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+        key = self.linears[1](key).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+        value = self.linears[2](value).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
 
         assert torch.equal(query, query_) and torch.equal(key, key_) and torch.equal(value, value_)
 
@@ -288,7 +292,7 @@ class MultiHeadedAttention(nn.Module):
         # x has shape bsz x length x d_model
         # 3) "Concat" using a view and apply a final linear.
         x = x.transpose(1, 2).contiguous() \
-            .view(nbatches, -1, self.heads * self.d_k)
+            .view(nbatches, -1, self.h * self.d_k)
         return self.linears[-1](x)
 
 
@@ -319,11 +323,11 @@ class Embeddings(nn.Module):
     # Embeddings are learned jointly
     def __init__(self, d_model, vocab):
         super(Embeddings, self).__init__()
-        self.embedder = nn.Embedding(vocab, d_model)
+        self.lut = nn.Embedding(vocab, d_model)
         self.d_model = d_model
 
     def forward(self, x):
-        return self.embedder(x) * math.sqrt(self.d_model)
+        return self.lut(x) * math.sqrt(self.d_model)
 
 
 class PositionalEncoding(nn.Module):
@@ -393,8 +397,8 @@ def PEncodings_demo():
     plt.legend(["dim %d" % p for p in range(0, 8)])
 
 
-def make_model(src_vocab_size, tgt_vocab_size, N=6,
-               d_model=512, d_ff=2048, h=8, dropout=0.1):
+def create_transformer_model(src_vocab_size, tgt_vocab_size, N=6,
+                             d_model=512, d_ff=2048, h=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     # d_ff is dimensionality of the inner layer
     c = copy.deepcopy
@@ -415,13 +419,13 @@ def make_model(src_vocab_size, tgt_vocab_size, N=6,
     # Initialize parameters with Glorot / fan_avg.
     for p in model.parameters():
         if p.dim() > 1:
-            nn.init.xavier_uniform(p)
+            nn.init.xavier_uniform_(p)
     return model
 
 
 def model_demo():
     # Small example model.
-    tmp_model = make_model(10, 10, 2)
+    tmp_model = create_transformer_model(10, 10, 2)
 
 
 # L = 3
@@ -462,6 +466,12 @@ def run_epoch(data_iter, model, loss_compute):
     total_loss = 0
     tokens = 0
     for i, batch in enumerate(data_iter):
+        # print("-" * 10 + "SRC" + "-" * 10)
+        # print(totext(batch.src, vocab[0]))
+        # print("-" * 10 + "TGT" + "-" * 10)
+        # print(totext(batch.trg, vocab[1]))
+        # print("-" * 30)
+
         out = model.forward(batch.src, batch.trg,
                             batch.src_mask, batch.trg_mask)
         loss = loss_compute(out, batch.trg_y, batch.ntokens.type(torch.float))
@@ -480,6 +490,8 @@ def run_epoch(data_iter, model, loss_compute):
 global max_src_in_batch, max_tgt_in_batch
 
 
+# Sentence pairs were batched together by approximate sequence length.
+# Each training batch contained a set of sentence pairs containing approximately 25000 source tokens and 25000 target tokens.
 def batch_size_fn(new, count, sofar):
     "Keep augmenting batch and calculate total number of tokens + padding."
     global max_src_in_batch, max_tgt_in_batch
@@ -522,11 +534,6 @@ class NoamOpt:
                 min(step ** (-0.5), step * self.warmup ** (-1.5)))
 
 
-def get_std_opt(model):
-    return NoamOpt(model.src_embed[0].d_model, 2, 4000,
-                   torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
-
-
 def hyperparam_demo():
     # Three settings of the lrate hyperparameters.
     opts = [NoamOpt(512, 1, 4000, None),
@@ -534,20 +541,20 @@ def hyperparam_demo():
             NoamOpt(256, 1, 4000, None)]
     plt.plot(np.arange(1, 20000), [[opt.rate(i) for opt in opts] for i in range(1, 20000)])
     plt.legend(["512:4000", "512:8000", "256:4000"])
+    plt.show()
 
 
 class LabelSmoothing(nn.Module):
-    "Implement label smoothing."
+    """
+    Implement label smoothing according to https://arxiv.org/pdf/1512.00567.pdf
+    """
 
     def __init__(self, vocab_size, padding_idx, smoothing=0.0):
         """
-        We implement label smoothing using the KL div loss.
-        Instead of using a one-hot target distribution,
-        we create a distribution that has confidence of the correct word and
-        the rest of the smoothing mass distributed throughout the vocabulary.
         :param vocab_size:
-        :param padding_idx:
-        :param smoothing:
+        :param padding_idx: index of padding token in vocabulary
+        :param smoothing: Amount of probability to be smoothed around vocabulary
+        (the bigger this is, the less confident model is and more aggresive smoothing is applied)
         """
         super(LabelSmoothing, self).__init__()
         # if size average is False on loss, losses are summed over minibatch and dimensions
@@ -560,16 +567,31 @@ class LabelSmoothing(nn.Module):
         self.true_dist = None
 
     def forward(self, x, target):
+        """
+        Label smoothing implemented using the KL div loss. Instead of using a one-hot target distribution,
+        we create a distribution that has confidence of the correct word
+        and the rest of the smoothing mass distributed throughout the vocabulary.
+        :param x: (batch * outlen) x VOCAB_LEN
+        :param target:  (batch * outlen)
+        :return:
+        """
         assert x.size(1) == self.size
         true_dist = x.data.clone()
+        # smooth rest of the mass (1-confidence) equally through vocabulary
         true_dist.fill_(self.smoothing / (self.size - 2))
+        # set confidence mass for correct words
         true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        # mask confidence for padding
         true_dist[:, self.padding_idx] = 0
+
+        # check whether padding idx is in-between targets
         mask = torch.nonzero(target.data == self.padding_idx)
         if mask.nelement() > 0:
+            # if so, set all those 'probabilities' to 0.0
             true_dist.index_fill_(0, mask.squeeze(), 0.0)
         self.true_dist = true_dist
         self.true_dist.requires_grad = False
+        # return KL div between x and this distribution
         return self.criterion(x, true_dist)
 
 
@@ -578,7 +600,7 @@ def labelsmoothing_demo1():
     Here we can see an example of how the mass is distributed to the words based on confidence.
     """
     # Example of label smoothing.
-    crit = LabelSmoothing(5, 0, 0.4)
+    crit = LabelSmoothing(vocab_size=5, padding_idx=0, smoothing=0.4)
     predict = torch.FloatTensor([[0, 0.2, 0.7, 0.1, 0],
                                  [0, 0.2, 0.7, 0.1, 0],
                                  [0, 0.2, 0.7, 0.1, 0]])
@@ -587,6 +609,7 @@ def labelsmoothing_demo1():
 
     # Show the target distributions expected by the system.
     plt.imshow(crit.true_dist)
+    plt.show()
 
 
 def labelsmoothing_demo2():
@@ -602,12 +625,13 @@ def labelsmoothing_demo2():
                                      ])
         # print(predict)
         return crit(predict.log(),
-                    torch.LongTensor([1])).data[0]
+                    torch.LongTensor([1])).item()
 
     plt.plot(np.arange(1, 100), [loss(x) for x in range(1, 100)])
+    plt.show()
 
 
-class SimpleLossCompute:
+class SingleGPULossCompute:
     "A simple loss compute and train function."
 
     def __init__(self, generator, criterion, opt=None):
@@ -617,12 +641,13 @@ class SimpleLossCompute:
 
     def __call__(self, x, y, norm):
         # x has shape batch x outlen x d
-        # y has shape bath x outlen
+        # y has shape batch x outlen
 
         x = self.generator(x)
         # x has shape batch x outlen x vocab
 
-        # x has shape x VOCAB_LEN
+        # x changed to shape (batch * outlen) x VOCAB_LEN
+        # y changed to shape (batch * outlen)
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               y.contiguous().view(-1)) / norm
         loss.backward()
@@ -640,9 +665,9 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
                            ys,
                            subsequent_mask(ys.size(1))
                            .type_as(src.data))
-        prob = model.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.data[0]
+        log_prob = model.generator(out[:, -1])
+        _, next_word = torch.max(log_prob, dim=1)
+        next_word = next_word.item()
         ys = torch.cat([ys,
                         torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
     return ys
@@ -668,17 +693,17 @@ def train_on_synthethic():
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     criterion = LabelSmoothing(vocab_size=vocab_size, padding_idx=0, smoothing=0.0)
-    model = make_model(src_vocab_size=vocab_size, tgt_vocab_size=vocab_size, N=3).to(device)
+    model = create_transformer_model(src_vocab_size=vocab_size, tgt_vocab_size=vocab_size, N=3).to(device)
     model_opt = NoamOpt(model.src_embed[0].d_model, 1, 400,
                         torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
 
     for epoch in range(10):
         model.train()
         run_epoch(data_gen(vocab_size, batch_size, nbatches=20, device=device), model,
-                  SimpleLossCompute(model.generator, criterion, model_opt))
+                  SingleGPULossCompute(model.generator, criterion, model_opt))
         model.eval()
         print(run_epoch(data_gen(vocab_size, batch_size, nbatches=5, device=device), model,
-                        SimpleLossCompute(model.generator, criterion, None)))
+                        SingleGPULossCompute(model.generator, criterion, None)))
 
     model.eval()
     print("Demo evaluation:")
@@ -690,14 +715,13 @@ def train_on_synthethic():
     print(f"Output: {list(decoded.cpu().numpy()[0])}")
 
 
-from torchtext import data
-
-
-class MyIterator(data.Iterator):
+class DataIterator(data.Iterator):
     def create_batches(self):
         if self.train:
             def pool(d, random_shuffler):
+                # Iterate over 100*batch chunks
                 for p in data.batch(d, self.batch_size * 100):
+                    # Sorted by maximum length of src/target sentence
                     p_batch = data.batch(
                         sorted(p, key=self.sort_key),
                         self.batch_size, self.batch_size_fn)
@@ -719,67 +743,190 @@ def rebatch(pad_idx, batch):
     return Batch(src, trg, pad_idx)
 
 
-def train_on_real():
-    from torchtext import data, datasets
+def pretrained_IWSLT_demo():
+    """
+    Demo on  IWSLT German-English Translation task
+    """
 
-    if True:
-        import spacy
-        spacy_de = spacy.load('de')
-        spacy_en = spacy.load('en')
+    spacy_de = spacy.load('de')
+    spacy_en = spacy.load('en')
 
-        def tokenize_de(text):
-            return [tok.text for tok in spacy_de.tokenizer(text)]
+    def tokenize_de(text):
+        return [tok.text for tok in spacy_de.tokenizer(text)]
 
-        def tokenize_en(text):
-            return [tok.text for tok in spacy_en.tokenizer(text)]
+    def tokenize_en(text):
+        return [tok.text for tok in spacy_en.tokenizer(text)]
 
-        BOS_WORD = '<s>'
-        EOS_WORD = '</s>'
-        BLANK_WORD = "<blank>"
-        SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD)
-        TGT = data.Field(tokenize=tokenize_en, init_token=BOS_WORD,
-                         eos_token=EOS_WORD, pad_token=BLANK_WORD)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    BOS_WORD = '<s>'
+    EOS_WORD = '</s>'
+    BLANK_WORD = "<blank>"
+    SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD)
+    TGT = data.Field(tokenize=tokenize_en, init_token=BOS_WORD,
+                     eos_token=EOS_WORD, pad_token=BLANK_WORD)
+    MAX_LEN = 100
+    train, val, test = datasets.IWSLT.splits(
+        exts=('.de', '.en'), fields=(SRC, TGT),
+        filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
+                              len(vars(x)['trg']) <= MAX_LEN)
+    MIN_FREQ = 2
+    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
+    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
+    BATCH_SIZE = 100
+    valid_iter = DataIterator(val, batch_size=BATCH_SIZE, device=device,
+                              repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
+                              batch_size_fn=batch_size_fn, train=False)
 
-        MAX_LEN = 100
-        train, val, test = datasets.IWSLT.splits(
-            exts=('.de', '.en'), fields=(SRC, TGT),
-            filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
-                                  len(vars(x)['trg']) <= MAX_LEN)
-        MIN_FREQ = 2
-        SRC.build_vocab(train.src, min_freq=MIN_FREQ)
-        TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
+    # using the pre_trained model from https://s3.amazonaws.com/opennmt-models/iwslt.pt
+    if not os.path.exists("iwslt.pt"):
+        wget.download("https://s3.amazonaws.com/opennmt-models/iwslt.pt")
 
-        BATCH_SIZE = 100
-        valid_iter = MyIterator(val, batch_size=BATCH_SIZE, device=0,
-                                repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
-                                batch_size_fn=batch_size_fn, train=False)
+    model = torch.load("iwslt.pt")
 
-        # use pre_trained model
-        # wget https://s3.amazonaws.com/opennmt-models/iwslt.pt
-        model = torch.load("iwslt.pt")
+    for i, batch in enumerate(valid_iter):
+        src = batch.src.transpose(0, 1)[:1]
+        src_mask = (src != SRC.vocab.stoi["<blank>"]).unsqueeze(-2)
+        out = greedy_decode(model, src, src_mask,
+                            max_len=60, start_symbol=TGT.vocab.stoi["<s>"])
+        print("Source:", end="\t")
+        for i in range(0, src.size(1)):
+            sym = SRC.vocab.itos[src[0, i]]
+            print(sym, end=" ")
+        print()
 
-        for i, batch in enumerate(valid_iter):
-            src = batch.src.transpose(0, 1)[:1]
-            src_mask = (src != SRC.vocab.stoi["<blank>"]).unsqueeze(-2)
-            out = greedy_decode(model, src, src_mask,
-                                max_len=60, start_symbol=TGT.vocab.stoi["<s>"])
-            print("Translation:", end="\t")
-            for i in range(1, out.size(1)):
-                sym = TGT.vocab.itos[out[0, i]]
-                if sym == "</s>": break
-                print(sym, end=" ")
-            print()
-            print("Target:", end="\t")
-            for i in range(1, batch.trg.size(0)):
-                sym = TGT.vocab.itos[batch.trg.data[i, 0]]
-                if sym == "</s>": break
-                print(sym, end=" ")
-            print()
-            break
+        print("Translation:", end="\t")
+        for i in range(1, out.size(1)):
+            sym = TGT.vocab.itos[out[0, i]]
+            if sym == "</s>": break
+            print(sym, end=" ")
+        print()
+        print("Target:", end="\t")
+        for i in range(1, batch.trg.size(0)):
+            sym = TGT.vocab.itos[batch.trg.data[i, 0]]
+            if sym == "</s>": break
+            print(sym, end=" ")
+        print()
+
+
+def totext(batch, vocab, batch_first=True, remove_specials=False, check_for_zero_vectors=True, pad_token='<blank>',
+           eos_token=None):
+    textlist = []
+    if not batch_first:
+        batch = batch.transpose(0, 1)
+    for ex in batch:
+        if remove_specials:
+            textlist.append(
+                ' '.join(
+                    [vocab.itos[ix.item()] for ix in ex
+                     if ix != vocab.stoi[pad_token] and eos_token is not None and ix != vocab.stoi["<eos>"]]))
+        else:
+            if check_for_zero_vectors:
+                text = []
+                for ix in ex:
+                    text.append(vocab.itos[ix.item()])
+                textlist.append(' '.join(text))
+            else:
+                textlist.append(' '.join([vocab.itos[ix.item()] for ix in ex]))
+    return textlist
+
+
+def train_IWSLT():
+    """
+    Train on  IWSLT German-English Translation task
+    """
+    spacy_de = spacy.load('de')
+    spacy_en = spacy.load('en')
+
+    def tokenize_de(text):
+        return [tok.text for tok in spacy_de.tokenizer(text)]
+
+    def tokenize_en(text):
+        return [tok.text for tok in spacy_en.tokenizer(text)]
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    BOS_WORD = '<s>'
+    EOS_WORD = '</s>'
+    BLANK_WORD = "<blank>"
+    SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD)
+    TGT = data.Field(tokenize=tokenize_en, init_token=BOS_WORD,
+                     eos_token=EOS_WORD, pad_token=BLANK_WORD)
+    MAX_LEN = 100
+    train, val, test = datasets.IWSLT.splits(
+        exts=('.de', '.en'), fields=(SRC, TGT),
+        filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
+                              len(vars(x)['trg']) <= MAX_LEN)
+    MIN_FREQ = 2
+    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
+    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
+
+    pad_idx = TGT.vocab.stoi["<blank>"]
+    model = create_transformer_model(len(SRC.vocab), len(TGT.vocab), N=6).to(device)
+    criterion = LabelSmoothing(vocab_size=len(TGT.vocab), padding_idx=pad_idx, smoothing=0.1)
+    BATCH_SIZE = 1024
+    # These examples are shuffled
+    train_iter = DataIterator(train, batch_size=BATCH_SIZE, device=device,
+                              repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
+                              batch_size_fn=batch_size_fn, train=True)
+    # These examples are not shuffled
+    valid_iter = DataIterator(val, batch_size=BATCH_SIZE, device=device,
+                              repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
+                              batch_size_fn=batch_size_fn, train=False)
+
+    model_opt = NoamOpt(model.src_embed[0].d_model, 1, 2000,
+                        torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+    for epoch in range(10):
+        model.train()
+        run_epoch((rebatch(pad_idx, b) for b in train_iter),
+                  model,
+                  SingleGPULossCompute(model.generator, criterion, model_opt))
+        model.eval()
+        loss = run_epoch((rebatch(pad_idx, b) for b in valid_iter),
+                         model,
+                         SingleGPULossCompute(model.generator, criterion, opt=None))
+        print(loss)
+
+
+#####################################
+# About IWSLT dataset:
+
+# These are the data sets for the MT tasks of the evaluation campaigns of IWSLT.
+# They are parallel data sets used for building and testing MT systems. They are publicly available
+# through the WIT3 website wit3.fbk.eu, see release: 2016-01.
+# IWSLT 2016: from/to English to/from Arabic, Czech, French, German
+# Data are crawled from the TED website and carry the respective licensing conditions (for training, tuning and testing MT systems).
+
+# Approximately, for each language pair, training sets include 2,000 talks, 200K sentences and 4M tokens per side,
+# while each dev and test sets 10-15 talks, 1.0K-1.5K sentences and 20K-30K tokens per side. In each edition,
+# the training sets of previous editions are re-used and updated with new talks added to the TED repository in the meanwhile.
+
+### Example of data format (tokens are joined via space)
+# Source:
+# ['Bakterien haben also nur sehr wenige Gene und genetische Informationen um sämtliche Merkmale , die sie ausführen , zu <unk> .',
+#  'Die Idee von Krankenhäusern und Kliniken stammt aus den 1780ern . Es wird Zeit , dass wir unser Denken aktualisieren .',
+#  'Ein Tier benötigt nur zwei Hundertstel einer Sekunde , um den Geruch zu unterscheiden , es geht also sehr schnell .',
+#  'Es stellte sich heraus , dass die Ölkatastrophe eine weißes Thema war , dass <unk> eine vorherrschend schwarzes Thema war .',
+#  'Wie ich in meinem Buch schreibe , bin ich genau so jüdisch , wie " Olive Garden " italienisch ist .',
+#  'Es gibt einen belüfteten Ziegel den ich letztes Jahr in <unk> machte , als Konzept für New <unk> in Architektur .',
+#  'Aber um die Zukunft des Wachstums zu verstehen , müssen wir Vorhersagen über die zugrunde liegenden <unk> des Wachstums machen .',
+#  'Ich hatte einen Plan , und ich hätte nie gedacht , wem dabei eine Schlüsselrolle zukommen würde : dem Banjo .',
+#  'Im Jahr 2000 hat er entdeckt , dass Ruß wahrscheinlich die zweitgrößte Ursache der globalen Erwärmung ist , nach CO2 .']
+#
+# Target:
+# ['<s> They have very few genes , and genetic information to encode all of the traits that they carry out . </s>',
+#  '<s> Humans invented the idea of hospitals and clinics in the 1780s . It is time to update our thinking . </s>',
+#  '<s> An animal only needs two hundredths of a second to discriminate the scent , so it goes extremely fast . </s>',
+#  '<s> It turns out that oil spill is a mostly white conversation , that cookout is a mostly black conversation . </s>',
+#  "<s> As I say in my book , I 'm Jewish in the same way the Olive Garden is Italian . </s>",
+#  "<s> There 's an aerated brick I did in <unk> last year , in Concepts for New Ceramics in Architecture . </s>",
+#  '<s> but to understand the future of growth , we need to make predictions about the underlying drivers of growth . </s>',
+#  '<s> I had a plan , and I never ever thought it would have anything to do with the banjo . </s>',
+#  '<s> In 2000 , he discovered that soot was probably the second leading cause of global warming , after CO2 . </s>']
 
 
 if __name__ == "__main__":
-    train_on_synthethic()
-    
-    # train on real is broken for now :(
-    # train_on_real()
+    # train_on_synthethic()
+    # labelsmoothing_demo1()
+    # labelsmoothing_demo2()
+    # hyperparam_demo()
+    # pretrained_IWSLT_demo()
+    train_IWSLT()
