@@ -1,6 +1,8 @@
 import copy
+import logging
 import math
 import os
+import sys
 import time
 
 import matplotlib.pyplot as plt
@@ -12,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wget
 from torchtext import data, datasets
+
+from util import setup_logging
 
 seaborn.set_context(context="talk")
 VERBOSE = False
@@ -697,7 +701,7 @@ def train_on_synthethic():
     model_opt = NoamOpt(model.src_embed[0].d_model, 1, 400,
                         torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
 
-    for epoch in range(10):
+    for epoch in range(2):
         model.train()
         run_epoch(data_gen(vocab_size, batch_size, nbatches=20, device=device), model,
                   SingleGPULossCompute(model.generator, criterion, model_opt))
@@ -884,6 +888,7 @@ def train_IWSLT():
                          model,
                          SingleGPULossCompute(model.generator, criterion, opt=None))
         print(loss)
+        logging.info(f"Validation Loss: {loss}")
 
 
 #####################################
@@ -924,6 +929,9 @@ def train_IWSLT():
 
 
 if __name__ == "__main__":
+    setup_logging(os.path.basename(sys.argv[0]).split(".")[0],
+                  logpath="logs/",
+                  config_path="configurations/logging.yml")
     # train_on_synthethic()
     # labelsmoothing_demo1()
     # labelsmoothing_demo2()
