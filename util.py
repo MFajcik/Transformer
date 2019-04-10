@@ -1,4 +1,5 @@
 import socket
+import sys
 
 __author__ = "Martin Fajčík"
 
@@ -80,3 +81,16 @@ def touch(f):
     if not os.path.exists(basedir):
         os.makedirs(basedir)
     open(f, 'a').close()
+
+import functools, traceback
+def gpu_mem_restore(func):
+    "Reclaim GPU RAM if CUDA out of memory happened, or execution was interrupted"
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except:
+            type, val, tb = sys.exc_info()
+            traceback.clear_frames(tb)
+            raise type(val).with_traceback(tb) from None
+    return wrapper
