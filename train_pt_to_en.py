@@ -336,7 +336,6 @@ def train_PT_to_EN():
         logging.info("-------------")
         logging.info(f"BLEU: {bleu}")
         logging.info("-------------")
-        exit(1)
         epoch += 1
 
 
