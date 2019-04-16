@@ -5,21 +5,29 @@ from tqdm import tqdm
 from playground import *
 from os.path import join
 from socket import gethostname
-from util import get_timestamp, gpu_mem_restore
-from nltk.translate.bleu_score import sentence_bleu as nltk_sentence_bleu
-from sacrebleu import corpus_bleu as sacrebleu_corpus_bleu
+from util import get_timestamp, gpu_mem_restore, SEP_TOKEN
+from nltk.translate.bleu_score import sentence_bleu as nltk_sentence_bleu, SmoothingFunction
+from sacrebleu import corpus_bleu as sacrebleu_corpus_bleu, BLEU
+from mosestokenizer import MosesDetokenizer
 
 BOS_WORD = '<s>'
 EOS_WORD = '</s>'
 BLANK_WORD = "<blank>"
 PATH_TO_DATA = ".data/pt-to-en/data"
 REF_FILE = os.path.join(PATH_TO_DATA, "val/text.en")
+BLEU_LOWERCASE = True
+BEAM_SIZE = 5
+DO_NOT_EVAL_SAVE_EPOCHS = 50
 
+
+### Get dataset here:
+# https://github.com/srvk/how2-dataset
+###
 
 class PT_TO_EN_dataset(Dataset):
     """The PT-to-END translation task"""
 
-    def __init__(self, path, fields, srcfile="text.pt", trgfile="text.en", **kwargs):
+    def __init__(self, path, fields, srcfile="text.pt.tokenized", trgfile="text.en.tokenized", **kwargs):
         if not isinstance(fields[0], (tuple, list)):
             fields = [('src', fields[0]), ('trg', fields[1])]
         src_path = join(path, srcfile)
@@ -54,13 +62,13 @@ class PT_TO_EN_dataset(Dataset):
         return tuple(d for d in (train_data, val_data, test_data))
 
 
-def get_BLEU_nltk(data_iter, model, src_vocab, tgt_vocab, total_batches, fname="translation", **kwargs):
-    def to_tokenized_text(tensor: torch.Tensor):
+def get_BLEU_nltk(data_iter, model, SRC, TGT, total_batches, fname="translation", **kwargs):
+    def to_tokenized_text(tensor):
         strs = []
-        for example_idx in range(tensor.shape[0]):
+        for example_idx in range(len(tensor)):
             s = []
             for i in tensor[example_idx]:
-                token = tgt_vocab.itos[i]
+                token = TGT.vocab.itos[i]
                 if token == BOS_WORD:
                     continue
                 if token == EOS_WORD:
@@ -72,7 +80,7 @@ def get_BLEU_nltk(data_iter, model, src_vocab, tgt_vocab, total_batches, fname="
 
     bleu_acc = 0
     N = 0
-    pbar = tqdm(total=total_batches)
+    # pbar = tqdm(total=total_batches)
     for i, batch in enumerate(data_iter):
         # Debug
         # print("-" * 10 + "SRC" + "-" * 10)
@@ -81,7 +89,17 @@ def get_BLEU_nltk(data_iter, model, src_vocab, tgt_vocab, total_batches, fname="
         # print("\n".join(totext(batch.trg, tgt_vocab)))
         # print("-" * 30)
 
-        decoded = greedy_decode(model, batch.src, batch.src_mask, **kwargs)
+        # Greedy decoding
+        # decoded = greedy_decode(model, batch.src, batch.src_mask, **kwargs)
+        # candidate_tokens = to_tokenized_text(decoded)
+
+        # Beam Search
+        decoded_hypotheses, logprobs = beam_search(model, batch.src, batch.src_mask, kwargs["max_len"],
+                                                   TGT.vocab.stoi["<blank>"], TGT.vocab.stoi[BOS_WORD],
+                                                   TGT.vocab.stoi[EOS_WORD], BEAM_SIZE, torch.device("cuda:0"))
+        most_probable_hypotheses = [h[0] for h in decoded_hypotheses]
+        candidate_tokens = to_tokenized_text(most_probable_hypotheses)
+        # with Beam BLEU: 0.6100825122348087
 
         # Debug
         # decoded_text = totext(decoded, tgt_vocab)
@@ -95,7 +113,6 @@ def get_BLEU_nltk(data_iter, model, src_vocab, tgt_vocab, total_batches, fname="
         # print("\n".join(decoded_text))
         # print("-" * 30)
 
-        candidate_tokens = to_tokenized_text(decoded)
         ref_tokens = to_tokenized_text(batch.trg)
         assert len(candidate_tokens) == len(ref_tokens)
 
@@ -107,85 +124,127 @@ def get_BLEU_nltk(data_iter, model, src_vocab, tgt_vocab, total_batches, fname="
         # print("-" * 10 + "PREDICTION" + "-" * 10)
         # for c in candidate_tokens: print(c)
         # print("-" * 30)
+        chencherry = SmoothingFunction().method4
 
         for k in range(len(candidate_tokens)):
-            weights = (0.25, 0.25, 0.25, 0.25)
+            weights = (1/3, 1/3, 0.25, 0.25)
             # usually BLEU 1 to 4 is averaged, but this is problem if the sequence is too short
             # if len(candidate_tokens[k]) < 4:
             #   weights = (1 / len(candidate_tokens[k]) for _ in range(len(candidate_tokens[k])))\
 
             # auto_reweigh parameter should actually do t he same as if calling above 2 lines!
+            # print("REF:")
+            # print(ref_tokens[k])
+            # print("CAND:")
+            # print(candidate_tokens[k])
             sent_bleu = nltk_sentence_bleu([ref_tokens[k]], candidate_tokens[k], weights,
-                                           auto_reweigh=True)
+                                           auto_reweigh=True, smoothing_function=chencherry)
 
             bleu_acc += sent_bleu
             N += 1
-        pbar.set_description(f"BLEU: {bleu_acc / N:.2f}")
-        pbar.update(1)
+        # pbar.set_description(f"BLEU: {bleu_acc / N:.2f}")
+        # pbar.update(1)
 
     return bleu_acc / N
 
 
-def get_BLEU_sacreBLEU(data_iter, model, src_vocab, tgt_vocab, total_batches, rfname="source", tfname="translation",
+def get_BLEU_sacreBLEU(data_iter, model, SRC, TGT, total_batches, rfname="ground_truth",
+                       tfname="translation",
                        **kwargs):
     flag = model.training
     model.eval()
     pbar = tqdm(total=total_batches)
-    hypotheses = "outputs/translation_pcfajcik_2019-04-10_17:57"
-    references = "outputs/source_pcfajcik_2019-04-10_17:57"
-    #references = f"outputs/{rfname}_{gethostname()}_{get_timestamp()}"
-    #hypotheses = f"outputs/{tfname}_{gethostname()}_{get_timestamp()}"
+    # hypotheses = "outputs/translation_pcfajcik_2019-04-12_10:39"
+    # references = "outputs/ground_truth_pcfajcik_2019-04-12_10:39"
+    references = f"outputs/{rfname}_{gethostname()}_{get_timestamp()}"
+    hypotheses = f"outputs/{tfname}_{gethostname()}_{get_timestamp()}"
+    detokenize = MosesDetokenizer('en')
+    with open(hypotheses, mode="w") as hf:
+        with open(references, mode="w") as rf:
+            for i, batch in enumerate(data_iter):
+                # Debug
+                # print("-" * 10 + "SRC" + "-" * 10)
+                # print("\n".join(totext(batch.src, src_vocab)))
+                # print("-" * 10 + "TGT" + "-" * 10)
+                # print("\n".join(totext(batch.trg, tgt_vocab)))
+                # print("-" * 30)
+                ground_truth = totext(batch.trg, TGT.vocab, sep=SEP_TOKEN)
 
+                # Greedy decode
+                # BLEU(score=59.28653001528331, counts=[34404, 26328, 20732, 16451],
+                #                  totals=[42856, 40834, 38812, 36816],
+                #                  precisions=[80.27814075042001, 64.47568202968115, 53.416469133257756, 44.68437635810517],
+                #                  bp=1.0, sys_len=42856, ref_len=42327)
+                # decoded = greedy_decode(model, batch.src, batch.src_mask, **kwargs)
+                # decoded_text = totext(decoded, TGT.vocab)
 
-    # with open(hypotheses, mode="w") as hf:
-    #     with open(references, mode="w") as rf:
-    #         for i, batch in enumerate(data_iter):
-    #             # Debug
-    #             # print("-" * 10 + "SRC" + "-" * 10)
-    #             # print("\n".join(totext(batch.src, src_vocab)))
-    #             # print("-" * 10 + "TGT" + "-" * 10)
-    #             # print("\n".join(totext(batch.trg, tgt_vocab)))
-    #             # print("-" * 30)
-    #             ground_truth = totext(batch.trg, tgt_vocab)
-    #             decoded = greedy_decode(model, batch.src, batch.src_mask, **kwargs)
-    #             decoded_text = totext(decoded, tgt_vocab)
-    #             # get rid of special tokens
-    #             clean_decoded_text = []
-    #             for s in decoded_text:
-    #                 idx = s.find("</s>")
-    #                 clean_decoded_text.append(s[:idx] if idx > 0 else s)
-    #
-    #             clean_ground_truth_text = []
-    #             for s in ground_truth:
-    #                 idx = s.find("</s>")
-    #                 clean_ground_truth_text.append(s[1:idx] if idx > 0 else s[1:])
-    #
-    #             if not len(clean_decoded_text) == batch.src.shape[0]:
-    #                 print(len(clean_decoded_text))
-    #                 print(batch.src.shape[0])
-    #
-    #                 print(clean_decoded_text)
-    #                 print(batch.src)
-    #
-    #             assert len(clean_decoded_text) == len(clean_ground_truth_text) == batch.src.shape[0]
-    #             hf.write("\n".join(clean_decoded_text) + "\n")
-    #             rf.write("\n".join(clean_ground_truth_text) + "\n")
-    #             pbar.update(1)
+                # Beam search
+                # h5 = BLEU(score=60.81557819840607, counts=[34450, 26529, 21028, 16806],
+                #           totals=[41803, 39781, 37759, 35763],
+                #           precisions=[82.41035332392413, 66.68761469043011, 55.69003416404036, 46.99270195453401],
+                #           bp=0.9875432501681118, sys_len=41803, ref_len=42327)
+                # with beam 30 BLEU: BLEU(score=60.70840003601362
+
+                # With correct detokenization
+                # BLEU(score=59.81264905560044
+                decoded_hypotheses, logprobs = beam_search(model, batch.src, batch.src_mask, kwargs["max_len"],
+                                                           TGT.vocab.stoi["<blank>"], TGT.vocab.stoi[BOS_WORD],
+                                                           TGT.vocab.stoi[EOS_WORD], BEAM_SIZE, torch.device("cuda:0"))
+
+                most_probable_hypotheses = [h[0] for h in decoded_hypotheses]
+                decoded_text = totext(most_probable_hypotheses, TGT.vocab, sep=SEP_TOKEN)
+
+                # get rid of special tokens
+                clean_decoded_text = []
+                for s in decoded_text:
+                    eos_idx = s.find(EOS_WORD)
+                    cleaned = s[:eos_idx] if eos_idx > 0 else s
+                    clean_decoded_text.append(detokenize(cleaned.strip().split(sep=SEP_TOKEN)))
+
+                clean_ground_truth_text = []
+                for s in ground_truth:
+                    eos_idx = s.find(EOS_WORD)
+                    bos_idx = s.find(BOS_WORD)
+                    if bos_idx > -1 and eos_idx > -1:
+                        clean_s = s[bos_idx + len(BOS_WORD):eos_idx]
+                    elif eos_idx > -1:
+                        clean_s = s[:eos_idx]
+                    elif bos_idx > -1:
+                        clean_s = s[bos_idx + len(BOS_WORD):]
+                    else:
+                        clean_s = s
+                    clean_ground_truth_text.append(detokenize(clean_s.strip().split(sep=SEP_TOKEN)))
+
+                if not len(clean_decoded_text) == batch.src.shape[0]:
+                    print(len(clean_decoded_text))
+                    print(batch.src.shape[0])
+
+                    print(clean_decoded_text)
+                    print(batch.src)
+
+                assert len(clean_decoded_text) == len(clean_ground_truth_text) == batch.src.shape[0]
+                hf.write("\n".join(clean_decoded_text) + "\n")
+                rf.write("\n".join(clean_ground_truth_text) + "\n")
+                pbar.update(1)
     if flag:
         model.train()
     with open(hypotheses) as hypf:
         with open(references) as reff:
-            return sacrebleu_corpus_bleu(hypf.read().split("\n")[:-1], [reff.read().split("\n")[:-1]])
+            return sacrebleu_corpus_bleu(hypf.read().split("\n")[:-1], [reff.read().split("\n")[:-1]],
+                                         lowercase=BLEU_LOWERCASE)
 
 
 @gpu_mem_restore
-def get_BLEU(*args, method="sacreBLEU", **kwargs):
-    if method == "nltk":
-        return get_BLEU_nltk(*args, **kwargs)
-    elif method == "sacreBLEU":
-        return get_BLEU_sacreBLEU(*args, **kwargs)
-    else:
-        raise NotImplementedError(f"Unknown BLEU evaluation method {method}")
+def get_BLEU(*args, method="nltk", **kwargs):
+    try:
+        if method == "nltk":
+            return get_BLEU_nltk(*args, **kwargs)
+        elif method == "sacreBLEU":
+            return get_BLEU_sacreBLEU(*args, **kwargs)
+        else:
+            raise NotImplementedError(f"Unknown BLEU evaluation method {method}")
+    except Exception as e:
+        logging.error(e)
 
 
 def train_PT_to_EN():
@@ -193,16 +252,17 @@ def train_PT_to_EN():
     Train on  Portuguese-English Translation task
     """
 
-    spacy_en = spacy.load('en')
-    spacy_pt = spacy.load('pt')
+    # spacy_en = spacy.load('en')
+    # spacy_pt = spacy.load('pt')
 
+    # I have pre-tokenized the outputs, all tokens are split via SEP_TOKEN
     def tokenize_pt(text):
-        # return str.split(text)
-        return [tok.text for tok in spacy_pt.tokenizer(text)]
+        return [t for t in str.split(text, sep=SEP_TOKEN) if t != ""]
+        # return [tok.text for tok in spacy_pt.tokenizer(text)]
 
     def tokenize_en(text):
-        # return str.split(text)
-        return [tok.text for tok in spacy_en.tokenizer(text)]
+        return [t for t in str.split(text, sep=SEP_TOKEN) if t != ""]
+        # return [tok.text for tok in spacy_en.tokenizer(text)]
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     SRC = data.Field(tokenize=tokenize_pt, pad_token=BLANK_WORD)
@@ -214,12 +274,9 @@ def train_PT_to_EN():
                                                # use only examples shorter than 512
                                                filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
                                                                      len(vars(x)['trg']) <= MAX_LEN)
-    # BEWARE OF THIS!
-    # FIXME: Do not calculate bleu to original file -- it may contain sentences longer then max len
-
-    MIN_FREQ = 2
-    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
-    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
+    MIN_VOCAB_FREQ = 2
+    SRC.build_vocab(train.src, min_freq=MIN_VOCAB_FREQ)
+    TGT.build_vocab(train.trg, min_freq=MIN_VOCAB_FREQ)
 
     pad_idx = TGT.vocab.stoi["<blank>"]
 
@@ -241,41 +298,47 @@ def train_PT_to_EN():
     bleu_batches = len([x for x in BLEU_iter])
     # model = create_transformer_model(len(SRC.vocab), len(TGT.vocab), N=6).to(device)
     model = torch.load(open("saved/"
-                            "pt_to_en_E12_BLEU_0.3608543580919268_<class 'playground.EncoderDecoder'>L_1.5111518934411912_2019-04-10_17:15_pcknot3.pt",
+                            "pt_to_en_E99_BLEU_0.576015182266847_<class 'playground.EncoderDecoder'>L_0.6752813091688094_2019-04-11_04:57_pcknot3.pt",
                             "rb"),
                        map_location=device)
     model_opt = NoamOpt(model.src_embed[0].d_model, 1, 2000,
                         torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
-    for epoch in range(100):
+    epoch = 0
+    while True:
         model.train()
         train_loss = val_loss = 0
-        # train_loss = run_epoch((rebatch(pad_idx, b) for b in train_iter),
-        #                       model,
-        #                       SingleGPULossCompute(model.generator, criterion, model_opt))
+        train_loss = run_epoch((rebatch(pad_idx, b) for b in train_iter),
+                               model,
+                               SingleGPULossCompute(model.generator, criterion, model_opt))
         model.eval()
-        # val_loss = run_epoch((rebatch(pad_idx, b) for b in valid_iter),
-        #                      model,
-        #                      SingleGPULossCompute(model.generator, criterion, opt=None))
-
-        # This may be memory exhaustive
+        val_loss = run_epoch((rebatch(pad_idx, b) for b in valid_iter),
+                             model,
+                             SingleGPULossCompute(model.generator, criterion, opt=None))
 
         bleu = -1
-        if epoch > -1:
-            bleu = get_BLEU((rebatch(pad_idx, b) for b in BLEU_iter), model, src_vocab=SRC.vocab,
-                            tgt_vocab=TGT.vocab,
+        if epoch > DO_NOT_EVAL_SAVE_EPOCHS or epoch == 0:
+            bleu = get_BLEU((rebatch(pad_idx, b) for b in BLEU_iter), model, SRC=SRC,
+                            TGT=TGT,
                             max_len=MAX_LEN_BLEU,
                             start_symbol=TGT.vocab.stoi["<s>"], total_batches=bleu_batches)
 
         logging.info(f"Train Loss: {train_loss}")
         logging.info(f"Validation Loss: {val_loss}")
-        model.to(torch.device("cpu"))
-        torch.save(model,
-                   f"saved/pt_to_en_E{epoch}_BLEU_{bleu.score}_{str(model.__class__)}"
-                   f"L_{val_loss}_{get_timestamp()}_{gethostname()}.pt")
-        model.to(device)
+        bleu_score = bleu if not hasattr(bleu, 'score') else bleu.score
+
+        if epoch > DO_NOT_EVAL_SAVE_EPOCHS or epoch == 0:
+            model.to(torch.device("cpu"))
+            torch.save(model,
+                       f"saved/pt_to_en_E{epoch}_BLEU_{bleu_score}_{str(model.__class__)}"
+                       f"L_{val_loss}_{get_timestamp()}_{gethostname()}.pt")
+            model.to(device)
+
         logging.info("-------------")
         logging.info(f"BLEU: {bleu}")
         logging.info("-------------")
+        exit(1)
+        epoch += 1
+
 
 # score=34.96939944413386,
 # counts=[29569, 18255, 12013, 8006],

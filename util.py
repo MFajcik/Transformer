@@ -1,6 +1,8 @@
 import socket
 import sys
 
+import spacy
+
 __author__ = "Martin Fajčík"
 
 import datetime
@@ -82,9 +84,13 @@ def touch(f):
         os.makedirs(basedir)
     open(f, 'a').close()
 
+
 import functools, traceback
+
+
 def gpu_mem_restore(func):
     "Reclaim GPU RAM if CUDA out of memory happened, or execution was interrupted"
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
@@ -93,4 +99,27 @@ def gpu_mem_restore(func):
             type, val, tb = sys.exc_info()
             traceback.clear_frames(tb)
             raise type(val).with_traceback(tb) from None
+
     return wrapper
+
+
+SEP_TOKEN = "█"
+
+
+def spacy_tokenize(file, language, separator=SEP_TOKEN):
+    spacy_ln = spacy.load(language)
+    with open(file, "r") as rf:
+        with open(file + ".tokenized", "w") as wf:
+            for line in rf:
+                tokenized = separator.join([tok.text for tok in spacy_ln.tokenizer(line)])
+                wf.write(tokenized + "\n")
+
+
+if __name__ == "__main__":
+    spacy_tokenize(".data/pt-to-en/data/train/text.en", "en")
+    spacy_tokenize(".data/pt-to-en/data/val/text.en", "en")
+    spacy_tokenize(".data/pt-to-en/data/dev5/text.en", "en")
+
+    spacy_tokenize(".data/pt-to-en/data/train/text.pt", "pt")
+    spacy_tokenize(".data/pt-to-en/data/val/text.pt", "pt")
+    spacy_tokenize(".data/pt-to-en/data/dev5/text.pt", "pt")
