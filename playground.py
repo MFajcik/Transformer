@@ -12,7 +12,7 @@ import spacy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wget
+#import wget
 from torchtext import data, datasets
 
 from util import setup_logging
@@ -463,7 +463,7 @@ class Batch:
         return tgt_mask
 
 
-def run_epoch(data_iter, model, loss_compute):
+def run_epoch(data_iter, model,loss_compute):
     "Standard Training and Logging Function"
     start = time.time()
     total_tokens = 0
@@ -482,12 +482,12 @@ def run_epoch(data_iter, model, loss_compute):
         total_loss += loss.item()
         total_tokens += batch.ntokens.item()
         tokens += batch.ntokens.item()
-        if i % 50 == 1:
-            elapsed = (time.time() - start) + 1e-20
-            print(f"Epoch Step: {i} Loss: {loss / batch.ntokens.type(torch.float)} "
-                  f"Tokens per Sec: {tokens / elapsed}")
-            start = time.time()
-            tokens = 0
+        # if i % 50 == 1:
+        #     elapsed = (time.time() - start) + 1e-20
+        #     print(f"Epoch Step: {i} Loss: {loss / batch.ntokens.type(torch.float)} "
+        #           f"Tokens per Sec: {tokens / elapsed}")
+        #     start = time.time()
+        #     tokens = 0
     return total_loss / total_tokens
 
 
@@ -654,8 +654,9 @@ class SingleGPULossCompute:
         # y changed to shape (batch * outlen)
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               y.contiguous().view(-1)) / norm
-        loss.backward()
+
         if self.opt is not None:
+            loss.backward()
             self.opt.step()
             self.opt.optimizer.zero_grad()
         return loss.data.item() * norm
@@ -865,9 +866,9 @@ def train_IWSLT():
                         torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
     for epoch in range(10):
         model.train()
-        run_epoch((rebatch(pad_idx, b) for b in train_iter),
-                  model,
-                  SingleGPULossCompute(model.generator, criterion, model_opt))
+        # run_epoch((rebatch(pad_idx, b) for b in train_iter),
+        #           model,
+        #           SingleGPULossCompute(model.generator, criterion, model_opt))
         model.eval()
         loss = run_epoch((rebatch(pad_idx, b) for b in valid_iter),
                          model,
@@ -986,6 +987,55 @@ class Beam():
         return list(map(lambda x: x.item(), hyp[::-1]))
 
 
+if __name__ == "__main__":
+    setup_logging(os.path.basename(sys.argv[0]).split(".")[0],
+                  logpath="logs/",
+                  config_path="configurations/logging.yml")
+    # train_on_synthethic()
+    # labelsmoothing_demo1()
+    # labelsmoothing_demo2()
+    # hyperparam_demo()
+    # pretrained_IWSLT_demo()
+    train_IWSLT()
+
+
+#####################################
+# About IWSLT dataset:
+
+# These are the data sets for the MT tasks of the evaluation campaigns of IWSLT.
+# They are parallel data sets used for building and testing MT systems. They are publicly available
+# through the WIT3 website wit3.fbk.eu, see release: 2016-01.
+# IWSLT 2016: from/to English to/from Arabic, Czech, French, German
+# Data are crawled from the TED website and carry the respective licensing conditions (for training, tuning and testing MT systems).
+
+# Approximately, for each language pair, training sets include 2,000 talks, 200K sentences and 4M tokens per side,
+# while each dev and test sets 10-15 talks, 1.0K-1.5K sentences and 20K-30K tokens per side. In each edition,
+# the training sets of previous editions are re-used and updated with new talks added to the TED repository in the meanwhile.
+
+### Example of data format (tokens are joined via space)
+# Source:
+# ['Bakterien haben also nur sehr wenige Gene und genetische Informationen um sämtliche Merkmale , die sie ausführen , zu <unk> .',
+#  'Die Idee von Krankenhäusern und Kliniken stammt aus den 1780ern . Es wird Zeit , dass wir unser Denken aktualisieren .',
+#  'Ein Tier benötigt nur zwei Hundertstel einer Sekunde , um den Geruch zu unterscheiden , es geht also sehr schnell .',
+#  'Es stellte sich heraus , dass die Ölkatastrophe eine weißes Thema war , dass <unk> eine vorherrschend schwarzes Thema war .',
+#  'Wie ich in meinem Buch schreibe , bin ich genau so jüdisch , wie " Olive Garden " italienisch ist .',
+#  'Es gibt einen belüfteten Ziegel den ich letztes Jahr in <unk> machte , als Konzept für New <unk> in Architektur .',
+#  'Aber um die Zukunft des Wachstums zu verstehen , müssen wir Vorhersagen über die zugrunde liegenden <unk> des Wachstums machen .',
+#  'Ich hatte einen Plan , und ich hätte nie gedacht , wem dabei eine Schlüsselrolle zukommen würde : dem Banjo .',
+#  'Im Jahr 2000 hat er entdeckt , dass Ruß wahrscheinlich die zweitgrößte Ursache der globalen Erwärmung ist , nach CO2 .']
+#
+# Target:
+# ['<s> They have very few genes , and genetic information to encode all of the traits that they carry out . </s>',
+#  '<s> Humans invented the idea of hospitals and clinics in the 1780s . It is time to update our thinking . </s>',
+#  '<s> An animal only needs two hundredths of a second to discriminate the scent , so it goes extremely fast . </s>',
+#  '<s> It turns out that oil spill is a mostly white conversation , that cookout is a mostly black conversation . </s>',
+#  "<s> As I say in my book , I 'm Jewish in the same way the Olive Garden is Italian . </s>",
+#  "<s> There 's an aerated brick I did in <unk> last year , in Concepts for New Ceramics in Architecture . </s>",
+#  '<s> but to understand the future of growth , we need to make predictions about the underlying drivers of growth . </s>',
+#  '<s> I had a plan , and I never ever thought it would have anything to do with the banjo . </s>',
+#  '<s> In 2000 , he discovered that soot was probably the second leading cause of global warming , after CO2 . </s>']
+
+
 def beam_search(model, src, src_mask, max_len, pad, bos, eos, beam_size, device):
     ''' Translation work in one batch '''
 
@@ -1035,21 +1085,12 @@ def beam_search(model, src, src_mask, max_len, pad, bos, eos, beam_size, device)
             return dec_partial_seq
 
         def predict_word(dec_seq, enc_output, n_active_inst, n_bm):
-            # print("Encoder output")
-            # print(enc_output.shape)
-            # print("Src mask")
-            # print(src_mask.shape)
-            # print("Decoder output")
-            # print(dec_seq.shape)
             assert enc_output.shape[0] == dec_seq.shape[0] == src_mask.shape[0]
             out = model.decode(enc_output, src_mask,
                                dec_seq,
                                subsequent_mask(dec_seq.size(1))
                                .type_as(src.data))
             word_logprob = model.generator(out[:, -1])
-            # dec_output, *_ = self.model.decoder(dec_seq, dec_pos, src_seq, enc_output)
-            # dec_output = dec_output[:, -1, :]  # Pick the last step: (bh * bm) * d_h
-            # word_prob = F.log_softmax(self.model.tgt_word_prj(dec_output), dim=1)
             word_logprob = word_logprob.view(n_active_inst, n_bm, -1)
 
             return word_logprob
@@ -1122,52 +1163,3 @@ def beam_search(model, src, src_mask, max_len, pad, bos, eos, beam_size, device)
     batch_hyp, batch_scores = collect_hypothesis_and_scores(inst_dec_beams, NBEST)
 
     return batch_hyp, batch_scores
-
-
-#####################################
-# About IWSLT dataset:
-
-# These are the data sets for the MT tasks of the evaluation campaigns of IWSLT.
-# They are parallel data sets used for building and testing MT systems. They are publicly available
-# through the WIT3 website wit3.fbk.eu, see release: 2016-01.
-# IWSLT 2016: from/to English to/from Arabic, Czech, French, German
-# Data are crawled from the TED website and carry the respective licensing conditions (for training, tuning and testing MT systems).
-
-# Approximately, for each language pair, training sets include 2,000 talks, 200K sentences and 4M tokens per side,
-# while each dev and test sets 10-15 talks, 1.0K-1.5K sentences and 20K-30K tokens per side. In each edition,
-# the training sets of previous editions are re-used and updated with new talks added to the TED repository in the meanwhile.
-
-### Example of data format (tokens are joined via space)
-# Source:
-# ['Bakterien haben also nur sehr wenige Gene und genetische Informationen um sämtliche Merkmale , die sie ausführen , zu <unk> .',
-#  'Die Idee von Krankenhäusern und Kliniken stammt aus den 1780ern . Es wird Zeit , dass wir unser Denken aktualisieren .',
-#  'Ein Tier benötigt nur zwei Hundertstel einer Sekunde , um den Geruch zu unterscheiden , es geht also sehr schnell .',
-#  'Es stellte sich heraus , dass die Ölkatastrophe eine weißes Thema war , dass <unk> eine vorherrschend schwarzes Thema war .',
-#  'Wie ich in meinem Buch schreibe , bin ich genau so jüdisch , wie " Olive Garden " italienisch ist .',
-#  'Es gibt einen belüfteten Ziegel den ich letztes Jahr in <unk> machte , als Konzept für New <unk> in Architektur .',
-#  'Aber um die Zukunft des Wachstums zu verstehen , müssen wir Vorhersagen über die zugrunde liegenden <unk> des Wachstums machen .',
-#  'Ich hatte einen Plan , und ich hätte nie gedacht , wem dabei eine Schlüsselrolle zukommen würde : dem Banjo .',
-#  'Im Jahr 2000 hat er entdeckt , dass Ruß wahrscheinlich die zweitgrößte Ursache der globalen Erwärmung ist , nach CO2 .']
-#
-# Target:
-# ['<s> They have very few genes , and genetic information to encode all of the traits that they carry out . </s>',
-#  '<s> Humans invented the idea of hospitals and clinics in the 1780s . It is time to update our thinking . </s>',
-#  '<s> An animal only needs two hundredths of a second to discriminate the scent , so it goes extremely fast . </s>',
-#  '<s> It turns out that oil spill is a mostly white conversation , that cookout is a mostly black conversation . </s>',
-#  "<s> As I say in my book , I 'm Jewish in the same way the Olive Garden is Italian . </s>",
-#  "<s> There 's an aerated brick I did in <unk> last year , in Concepts for New Ceramics in Architecture . </s>",
-#  '<s> but to understand the future of growth , we need to make predictions about the underlying drivers of growth . </s>',
-#  '<s> I had a plan , and I never ever thought it would have anything to do with the banjo . </s>',
-#  '<s> In 2000 , he discovered that soot was probably the second leading cause of global warming , after CO2 . </s>']
-
-
-if __name__ == "__main__":
-    setup_logging(os.path.basename(sys.argv[0]).split(".")[0],
-                  logpath="logs/",
-                  config_path="configurations/logging.yml")
-    # train_on_synthethic()
-    # labelsmoothing_demo1()
-    # labelsmoothing_demo2()
-    # hyperparam_demo()
-    # pretrained_IWSLT_demo()
-    train_IWSLT()
